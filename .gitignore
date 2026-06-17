@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+
+# Case logs generated at runtime — commit selectively from case_logs/
+case_log_*.md
