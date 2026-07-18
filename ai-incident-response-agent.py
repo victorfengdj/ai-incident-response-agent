@@ -1,11 +1,10 @@
 #!/usr/bin/python3
-import boto3
-import json
 import datetime
 import subprocess
 import os
+import boto3
 import requests
-from botocore.exceptions import ClientError
+from anthropic import AnthropicBedrock
 from dotenv import load_dotenv
 
 # Load VIRUSTOTAL_API_KEY and any other secrets from a local .env file so the
@@ -13,10 +12,43 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- 1. Configuration & Persona ---
-# Ensure AWS credentials are set via 'aws configure' or IAM Roles
-client = boto3.client("bedrock-runtime", region_name="us-east-1")
-# Cross-region inference profile required for on-demand invocation of Haiku 4.5.
-model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+# Ensure AWS credentials are set via 'aws configure' or IAM Roles.
+# Opus 4.6 is served via Bedrock's InvokeModel path — the cross-region
+# inference profile ("us." prefix) is required for on-demand invocation.
+client = AnthropicBedrock(aws_region="us-east-1")
+model_id = "us.anthropic.claude-opus-4-6-v1"
+
+# Optional Bedrock Guardrail (set BEDROCK_GUARDRAIL_ID in .env to enable).
+# Configured with the prompt-attack filter: command output fed back from a
+# potentially compromised host is attacker-controllable text, so it is
+# screened for prompt-injection via the vendor-independent ApplyGuardrail API
+# before it reaches the model.
+guardrail_id = os.getenv("BEDROCK_GUARDRAIL_ID")
+guardrail_version = os.getenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
+bedrock_runtime = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+def guardrail_screen(text):
+    """Screen text with the Bedrock Guardrail. Returns None if the content is
+    allowed, or the guardrail's block message if it intervened. No-op (returns
+    None) when no guardrail is configured."""
+    if not guardrail_id:
+        return None
+    try:
+        result = bedrock_runtime.apply_guardrail(
+            guardrailIdentifier=guardrail_id,
+            guardrailVersion=guardrail_version,
+            source="INPUT",
+            content=[{"text": {"text": text}}],
+        )
+        if result.get("action") == "GUARDRAIL_INTERVENED":
+            outputs = result.get("outputs", [])
+            msg = outputs[0]["text"] if outputs else "content blocked by guardrail"
+            return f"GUARDRAIL BLOCKED: {msg}"
+    except Exception as e:
+        # Fail closed on unexpected guardrail errors — screening untrusted
+        # host output is the whole point, so don't silently pass it through.
+        return f"GUARDRAIL ERROR (input not screened): {str(e)}"
+    return None
 
 SYSTEM_PROMPT = """
 You are a Tier 3 Cybersecurity Incident Response Architect. You are investigating
@@ -30,8 +62,42 @@ For every analysis:
 4. Provide a 'Database Query' (SQL) for Oracle Unified Auditing if applicable.
 5. Provide a 'Business Case' if a security gap is identified.
 
+Host identifiers such as HOST-A (DMZ web server) and DB-1 (internal Oracle
+database) are pseudonymized labels for internal addresses. Use them verbatim
+in your analysis, forensic commands, and SQL queries — do not invent IP
+addresses for them.
+
 Keep your tone professional, technical, and concise.
 """
+
+# --- Pseudonymization of internal IPs ---
+# Internal topology (private IPs + host roles) is Internal/Confidential data.
+# The model only ever sees stable tokens; real addresses are re-substituted
+# locally before anything is displayed or written to the case log.
+ip_token_map = {
+    "10.0.0.4": "HOST-A",   # DMZ web server (default lab address)
+    "172.18.18.2": "DB-1",  # internal Oracle DB (default lab address)
+}
+
+def register_internal_hosts(web_ip, db_ip):
+    """(Re)build the IP-to-token map from the current SIEM alert."""
+    ip_token_map.clear()
+    if web_ip:
+        ip_token_map[web_ip] = "HOST-A"
+    if db_ip:
+        ip_token_map[db_ip] = "DB-1"
+
+def pseudonymize(text):
+    """Replace internal IPs with tokens before text is sent to the model."""
+    for ip, token in ip_token_map.items():
+        text = text.replace(ip, token)
+    return text
+
+def reveal(text):
+    """Re-substitute real internal IPs for tokens in model output."""
+    for ip, token in ip_token_map.items():
+        text = text.replace(token, ip)
+    return text
 
 # Full conversation history is passed on every call so the model retains context
 # across the entire investigation session. 'clear' resets it mid-session.
@@ -43,7 +109,11 @@ class CaseManager:
     """Manages a Markdown-based forensic log for the investigation session."""
     def __init__(self):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.filename = f"case_log_{timestamp}.md"
+        # Store logs in the case_logs/ folder next to this script, regardless
+        # of the directory the agent is launched from.
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "case_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self.filename = os.path.join(log_dir, f"case_log_{timestamp}.md")
         with open(self.filename, "w") as f:
             f.write(f"# Forensic Investigation Log: {timestamp}\n")
             f.write(f"**Started:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -72,8 +142,8 @@ def check_virustotal(ip_address):
             stats = response.json()['data']['attributes']['last_analysis_stats']
             malicious = stats['malicious']
             if malicious > 0:
-                return f"⚠️ ALERT: VirusTotal flags this IP as MALICIOUS ({malicious} hits)."
-            return "✅ VirusTotal: IP appears clean."
+                return f"ALERT: VirusTotal flags this IP as MALICIOUS ({malicious} hits)."
+            return "VirusTotal: IP appears clean."
         return f"[-] VirusTotal: Lookup failed (HTTP {response.status_code})."
     except Exception as e:
         return f"[-] VirusTotal Error: {str(e)}"
@@ -134,35 +204,59 @@ def run_remote_command(target_ip, command):
     return "Execution skipped by user."
 
 def ask_bedrock(prompt_text, is_system_result=False):
-    """Interfaces with AWS Bedrock (Claude Haiku 4.5)."""
+    """Interfaces with AWS Bedrock (Claude Opus 4.6)."""
     # Tag command output distinctly so the model treats it as observational
     # evidence rather than analyst instructions.
     formatted_input = f"--- OBSERVED SYSTEM OUTPUT ---\n{prompt_text}" if is_system_result else prompt_text
+
+    # Internal IPs never leave the machine — the model (and the conversation
+    # history sent with every request) only sees HOST-A / DB-1 tokens.
+    formatted_input = pseudonymize(formatted_input)
+
+    # Screen the (pseudonymized) input for prompt injection before it reaches
+    # the model. Command output fed back from a potentially compromised host is
+    # attacker-controllable, so a block here stops a hijacked analysis loop.
+    # Screening the pseudonymized text keeps internal IPs off the wire.
+    block = guardrail_screen(formatted_input)
+    if block:
+        return block
 
     conversation_history.append({
         "role": "user",
         "content": [{"type": "text", "text": formatted_input}]
     })
 
-    native_request = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 2000,
-        # Low temperature keeps forensic recommendations consistent and reproducible.
-        "temperature": 0.2,
+    # Adaptive thinking is the recommended mode on Opus 4.6 and improves
+    # multi-step forensic reasoning; it must be enabled explicitly (the model
+    # runs without thinking when the parameter is omitted).
+    request_params = {
+        "max_tokens": 16000,
+        "thinking": {"type": "adaptive"},
         "system": SYSTEM_PROMPT,
-        "messages": conversation_history
+        "messages": conversation_history,
     }
 
     try:
-        response = client.invoke_model(modelId=model_id, body=json.dumps(native_request))
-        response_body = json.loads(response["body"].read())
-        assistant_text = response_body["content"][0]["text"]
+        response = client.messages.create(model=model_id, **request_params)
 
+        # Safety refusals return HTTP 200 with stop_reason "refusal" —
+        # surface them to the analyst instead of showing empty output.
+        if response.stop_reason == "refusal":
+            conversation_history.pop()
+            return "REQUEST DECLINED: the model refused this analysis request."
+
+        assistant_text = "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+
+        # Append the full content (including thinking blocks) so multi-turn
+        # context is preserved as the API expects. History keeps the tokens —
+        # only the locally displayed/logged text is re-substituted.
         conversation_history.append({
             "role": "assistant",
-            "content": [{"type": "text", "text": assistant_text}]
+            "content": response.content
         })
-        return assistant_text
+        return reveal(assistant_text)
     except Exception as e:
         return f"CRITICAL BEDROCK ERROR: {str(e)}"
 
@@ -213,6 +307,9 @@ FREE-FORM QUESTIONS:
             alert_data, prompt = parse_siem_alert(user_input)
             if alert_data:
                 current_alert_data = alert_data
+                # Map this alert's internal hosts to pseudonymization tokens
+                register_internal_hosts(alert_data.get('sm_dst_ip'),
+                                        alert_data.get('sm_oracle_db_ip'))
                 src_ip = alert_data.get('sm_src_ip')
                 print(f"[*] Consulting VirusTotal for Source IP: {src_ip}...")
                 vt_report = check_virustotal(src_ip)
